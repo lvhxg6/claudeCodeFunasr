@@ -8,6 +8,8 @@ websockets>=12.0
 # FunASR 核心
 funasr>=1.0.0
 modelscope>=1.9.0
+torch>=2.0.0
+torchaudio>=2.0.0
 
 # 音频处理
 numpy>=1.24.0
