@@ -1,0 +1,29 @@
+# FunASR 服务配置
+
+model:
+  # 流式模型
+  name: "paraformer-zh-streaming"
+
+  # VAD 模型（语音端点检测）
+  vad_model: "fsmn-vad"
+
+  # 标点恢复模型
+  punc_model: "ct-punc"
+
+server:
+  host: "127.0.0.1"
+  port: 10095
+
+  # WebSocket 路径
+  ws_path: "/ws/transcribe"
+
+streaming:
+  # 音频块大小（毫秒）
+  chunk_ms: 200
+
+  # 采样率
+  sample_rate: 16000
+
+logging:
+  level: "INFO"
+  file: "logs/service.log"
