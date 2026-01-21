@@ -48,35 +48,60 @@ cd /Users/liubu/hx/AI-SystemService/claudeCodeFunasr
 
 ## 使用
 
-### 启动服务
+### 创建命令行工具（首次安装后执行一次）
 
 ```bash
+sudo ln -sf /Users/liubu/hx/AI-SystemService/claudeCodeFunasr/scripts/funasr-service.sh /usr/local/bin/funasr-service
+```
+
+### 服务管理命令
+
+| 命令 | 说明 |
+|------|------|
+| `funasr-service start` | 启动服务 |
+| `funasr-service stop` | 停止服务 |
+| `funasr-service restart` | 重启服务 |
+| `funasr-service status` | 查看服务状态 |
+| `funasr-service logs` | 查看日志（实时跟踪） |
+| `funasr-service logs 100` | 查看最近 100 行日志 |
+| `funasr-service enable` | 启用开机自启动 |
+| `funasr-service disable` | 禁用开机自启动 |
+| `funasr-service help` | 显示帮助信息 |
+
+### 示例
+
+```bash
+# 启动服务
 funasr-service start
-```
 
-### 查看状态
-
-```bash
+# 查看状态
 funasr-service status
-```
 
-### 查看日志
+# 输出示例：
+# === FunASR 服务状态 ===
+# ✓ FunASR 服务正在运行
+#   PID: 21755
+#   地址: http://127.0.0.1:10095
+#
+#   健康检查:
+#   {"status":"ok","models":{"asr":true,"vad":true,"punc":true}}
+#
+#   开机自启动: 已启用
 
-```bash
+# 停止服务
+funasr-service stop
+
+# 查看日志
 funasr-service logs
 ```
 
-### 停止服务
+### 系统服务说明
 
-```bash
-funasr-service stop
-```
+本服务使用 macOS launchd 进行管理，具有以下特性：
 
-### 重启服务
-
-```bash
-funasr-service restart
-```
+- **开机自启动**：通过 `enable` 命令启用后，系统登录时自动启动服务
+- **异常自动重启**：服务意外退出时，launchd 会自动重新启动
+- **服务配置文件**：`~/Library/LaunchAgents/com.liubu.funasr.plist`
 
 ## API 接口
 
