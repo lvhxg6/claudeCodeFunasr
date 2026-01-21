@@ -180,6 +180,16 @@ async def transcribe_audio(
         )
 
 
+# 全局连接管理
+active_connections: set = set()
+
+# 从配置文件读取流式配置
+streaming_config = CONFIG.get("streaming", {})
+MAX_CONNECTIONS = streaming_config.get("max_connections", 10)
+INFERENCE_BATCH_SIZE = streaming_config.get("inference_batch_size", 10)  # 每 N 块推理一次
+MAX_BUFFER_SIZE = streaming_config.get("max_buffer_size", 100)  # 最大缓冲区大小（约 3 秒音频）
+
+
 @app.websocket("/ws/transcribe")
 async def websocket_transcribe(websocket: WebSocket):
     """
@@ -189,8 +199,13 @@ async def websocket_transcribe(websocket: WebSocket):
     客户端发送：
     {
         "type": "audio",
-        "data": "<base64编码的音频数据>",
-        "is_final": false
+        "data": "<base64编码的原始PCM数据>",
+        "is_final": false,
+        "format": {
+            "sample_rate": 16000,
+            "channels": 1,
+            "sample_width": 2
+        }
     }
 
     服务端返回：
@@ -200,12 +215,20 @@ async def websocket_transcribe(websocket: WebSocket):
         "is_final": false
     }
     """
+    # 检查连接数限制
+    if len(active_connections) >= MAX_CONNECTIONS:
+        await websocket.close(code=1008, reason="服务器连接数已满")
+        logger.warning("拒绝新连接：已达到最大连接数")
+        return
+
     await websocket.accept()
-    logger.info("WebSocket 连接已建立")
+    active_connections.add(websocket)
+    logger.info(f"WebSocket 连接已建立，当前连接数: {len(active_connections)}")
 
     # 音频缓冲区
     audio_buffer = []
     accumulated_text = ""
+    chunks_since_inference = 0
 
     try:
         while True:
@@ -219,62 +242,83 @@ async def websocket_transcribe(websocket: WebSocket):
                 # 解码音频数据
                 audio_base64 = data.get("data", "")
                 is_final = data.get("is_final", False)
+                audio_format = data.get("format", {})
 
                 if audio_base64:
                     # Base64 解码
                     audio_bytes = base64.b64decode(audio_base64)
 
-                    # 转换为 numpy 数组
-                    audio_data, _ = sf.read(io.BytesIO(audio_bytes))
+                    # 从原始 PCM 数据转换为 numpy 数组
+                    sample_rate = audio_format.get("sample_rate", 16000)
+                    channels = audio_format.get("channels", 1)
+                    sample_width = audio_format.get("sample_width", 2)
+
+                    # 将字节转换为 int16 数组
+                    audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
+
+                    # 归一化到 [-1, 1]
+                    audio_data = audio_data.astype(np.float32) / 32768.0
 
                     # 如果是立体声，转换为单声道
-                    if len(audio_data.shape) > 1:
-                        audio_data = audio_data.mean(axis=1)
+                    if channels == 2:
+                        audio_data = audio_data.reshape(-1, 2).mean(axis=1)
 
                     # 添加到缓冲区
                     audio_buffer.append(audio_data)
+                    chunks_since_inference += 1
 
-                    # 合并音频
-                    full_audio = np.concatenate(audio_buffer)
+                    # 限制缓冲区大小，防止内存溢出
+                    if len(audio_buffer) > MAX_BUFFER_SIZE:
+                        # 移除最旧的块
+                        audio_buffer.pop(0)
+                        logger.warning("缓冲区已满，移除最旧的音频块")
 
-                    # 流式识别
-                    try:
-                        result = asr_model.generate(
-                            input=full_audio,
-                            batch_size_s=300,
-                        )
+                    # 优化：每 INFERENCE_BATCH_SIZE 块或最终块才推理
+                    should_infer = is_final or chunks_since_inference >= INFERENCE_BATCH_SIZE
 
-                        # 提取文本
-                        new_text = ""
-                        if result and len(result) > 0:
-                            new_text = result[0].get("text", "")
+                    if should_infer and audio_buffer:
+                        # 合并音频
+                        full_audio = np.concatenate(audio_buffer)
+                        chunks_since_inference = 0
 
-                        # 计算增量文本
-                        if new_text.startswith(accumulated_text):
-                            increment = new_text[len(accumulated_text):]
-                        else:
-                            # 如果不是前缀，说明有修正，返回完整文本
-                            increment = new_text
-                            accumulated_text = ""
+                        # 流式识别
+                        try:
+                            result = asr_model.generate(
+                                input=full_audio,
+                                batch_size_s=300,
+                            )
 
-                        # 更新累积文本
-                        accumulated_text = new_text
+                            # 提取文本
+                            new_text = ""
+                            if result and len(result) > 0:
+                                new_text = result[0].get("text", "")
 
-                        # 发送结果
-                        if increment:
+                            # 计算增量文本
+                            if new_text.startswith(accumulated_text):
+                                increment = new_text[len(accumulated_text):]
+                            else:
+                                # 如果不是前缀，说明有修正，返回完整文本
+                                increment = new_text
+                                accumulated_text = ""
+
+                            # 更新累积文本
+                            accumulated_text = new_text
+
+                            # 发送结果
+                            if increment:
+                                await websocket.send_json({
+                                    "type": "partial" if not is_final else "final",
+                                    "text": increment,
+                                    "is_final": is_final
+                                })
+                                logger.debug(f"发送增量文本: {increment}")
+
+                        except Exception as e:
+                            logger.error(f"识别失败: {e}")
                             await websocket.send_json({
-                                "type": "partial" if not is_final else "final",
-                                "text": increment,
-                                "is_final": is_final
+                                "type": "error",
+                                "error": str(e)
                             })
-                            logger.debug(f"发送增量文本: {increment}")
-
-                    except Exception as e:
-                        logger.error(f"识别失败: {e}")
-                        await websocket.send_json({
-                            "type": "error",
-                            "error": str(e)
-                        })
 
                 # 如果是最后一块，进行标点恢复
                 if is_final and accumulated_text and punc_model:
@@ -296,11 +340,13 @@ async def websocket_transcribe(websocket: WebSocket):
                     # 重置状态
                     audio_buffer = []
                     accumulated_text = ""
+                    chunks_since_inference = 0
 
             elif msg_type == "reset":
                 # 重置状态
                 audio_buffer = []
                 accumulated_text = ""
+                chunks_since_inference = 0
                 await websocket.send_json({
                     "type": "reset",
                     "status": "ok"
@@ -309,6 +355,9 @@ async def websocket_transcribe(websocket: WebSocket):
 
     except WebSocketDisconnect:
         logger.info("WebSocket 连接已断开")
+    except asyncio.CancelledError:
+        logger.warning("WebSocket 任务被取消")
+        raise  # 重新抛出以正确清理
     except Exception as e:
         logger.error(f"WebSocket 错误: {e}", exc_info=True)
         try:
@@ -318,6 +367,12 @@ async def websocket_transcribe(websocket: WebSocket):
             })
         except:
             pass
+    finally:
+        # 确保资源清理
+        audio_buffer.clear()
+        accumulated_text = ""
+        active_connections.discard(websocket)
+        logger.info(f"WebSocket 资源已清理，当前连接数: {len(active_connections)}")
 
 
 if __name__ == "__main__":

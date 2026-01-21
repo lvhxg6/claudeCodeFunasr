@@ -24,6 +24,15 @@ streaming:
   # 采样率
   sample_rate: 16000
 
+  # 推理批次大小（音频块数量）
+  inference_batch_size: 10
+
+  # 最大缓冲区大小
+  max_buffer_size: 100
+
+  # 最大并发连接数
+  max_connections: 10
+
 logging:
   level: "INFO"
   file: "logs/service.log"
