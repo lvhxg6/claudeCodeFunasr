@@ -414,18 +414,18 @@ async def websocket_transcribe(websocket: WebSocket):
                             # 更新累积文本
                             accumulated_text = new_text
 
-                            # 发送结果
-                            if increment:
+                            # 发送结果：发送完整累积文本，让客户端计算增量
+                            if new_text:
                                 with open("/tmp/funasr_trace.log", "a") as f:
-                                    f.write(f"[TRACE] 准备发送结果: {increment}\n")
+                                    f.write(f"[TRACE] 准备发送累积文本: {accumulated_text}\n")
                                     f.flush()
 
                                 await websocket.send_json({
                                     "type": "partial" if not is_final else "final",
-                                    "text": increment,
+                                    "text": accumulated_text,  # 发送完整累积文本
                                     "is_final": is_final
                                 })
-                                logger.debug(f"发送增量文本: {increment}")
+                                logger.debug(f"发送累积文本: {accumulated_text}")
 
                                 with open("/tmp/funasr_trace.log", "a") as f:
                                     f.write(f"[TRACE] 结果已发送\n")
