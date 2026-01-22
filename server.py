@@ -33,6 +33,11 @@ def get_device() -> str:
     else:
         return "cpu"
 
+
+def calculate_audio_energy(audio_data: np.ndarray) -> float:
+    """计算音频能量（RMS）"""
+    return float(np.sqrt(np.mean(audio_data ** 2)))
+
 # 项目根目录
 PROJECT_ROOT = Path(__file__).parent
 
@@ -207,6 +212,7 @@ streaming_config = CONFIG.get("streaming", {})
 MAX_CONNECTIONS = streaming_config.get("max_connections", 10)
 INFERENCE_BATCH_SIZE = streaming_config.get("inference_batch_size", 10)  # 每 N 块推理一次
 MAX_BUFFER_SIZE = streaming_config.get("max_buffer_size", 100)  # 最大缓冲区大小（约 3 秒音频）
+ENERGY_THRESHOLD = streaming_config.get("energy_threshold", 0.02)  # 音量阈值，低于此值视为噪音
 
 
 @app.websocket("/ws/transcribe")
@@ -345,6 +351,19 @@ async def websocket_transcribe(websocket: WebSocket):
                         # 合并音频
                         full_audio = np.concatenate(audio_buffer)
                         chunks_since_inference = 0
+
+                        # 音量过滤：检查音频能量是否超过阈值
+                        audio_energy = calculate_audio_energy(full_audio)
+                        with open("/tmp/funasr_trace.log", "a") as f:
+                            f.write(f"[TRACE] 音频能量={audio_energy:.4f}, 阈值={ENERGY_THRESHOLD}\n")
+                            f.flush()
+
+                        if audio_energy < ENERGY_THRESHOLD:
+                            logger.debug(f"音频能量 {audio_energy:.4f} 低于阈值 {ENERGY_THRESHOLD}，跳过识别")
+                            with open("/tmp/funasr_trace.log", "a") as f:
+                                f.write(f"[TRACE] 能量过低，跳过识别\n")
+                                f.flush()
+                            continue  # 跳过低能量音频，不进行识别
 
                         # 流式识别（在线程池中执行，避免阻塞事件循环）
                         try:

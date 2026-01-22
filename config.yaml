@@ -33,6 +33,11 @@ streaming:
   # 最大并发连接数
   max_connections: 10
 
+  # 音量阈值（RMS，0.0-1.0）
+  # 低于此阈值的音频被视为噪音，不进行识别
+  # 建议值：0.01-0.05，根据环境噪音调整
+  energy_threshold: 0.02
+
 logging:
   level: "INFO"
   file: "logs/service.log"
