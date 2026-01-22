@@ -24,11 +24,15 @@ streaming:
   # 采样率
   sample_rate: 16000
 
-  # 推理批次大小（音频块数量）
-  inference_batch_size: 3
+  # FunASR 流式参数
+  # chunk_size: [左填充, 处理窗口, 前向看]
+  # 10*60ms=600ms 处理窗口, 5*60ms=300ms 前向看
+  # 总延迟约 900ms
+  chunk_size: [0, 10, 5]
 
-  # 最大缓冲区大小
-  max_buffer_size: 100
+  # 编码器/解码器回看
+  encoder_chunk_look_back: 4
+  decoder_chunk_look_back: 1
 
   # 最大并发连接数
   max_connections: 10

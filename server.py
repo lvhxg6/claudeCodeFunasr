@@ -2,6 +2,7 @@
 """
 FunASR 语音识别服务
 支持 HTTP API（非流式）和 WebSocket（流式）
+使用 FunASR cache 机制实现真正的流式识别
 """
 
 import asyncio
@@ -13,7 +14,7 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import numpy as np
 import soundfile as sf
@@ -37,6 +38,7 @@ def get_device() -> str:
 def calculate_audio_energy(audio_data: np.ndarray) -> float:
     """计算音频能量（RMS）"""
     return float(np.sqrt(np.mean(audio_data ** 2)))
+
 
 # 项目根目录
 PROJECT_ROOT = Path(__file__).parent
@@ -210,15 +212,19 @@ active_connections: set = set()
 # 从配置文件读取流式配置
 streaming_config = CONFIG.get("streaming", {})
 MAX_CONNECTIONS = streaming_config.get("max_connections", 10)
-INFERENCE_BATCH_SIZE = streaming_config.get("inference_batch_size", 10)  # 每 N 块推理一次
-MAX_BUFFER_SIZE = streaming_config.get("max_buffer_size", 100)  # 最大缓冲区大小（约 3 秒音频）
-ENERGY_THRESHOLD = streaming_config.get("energy_threshold", 0.02)  # 音量阈值，低于此值视为噪音
+ENERGY_THRESHOLD = streaming_config.get("energy_threshold", 0.02)
+
+# FunASR 流式参数
+CHUNK_SIZE = streaming_config.get("chunk_size", [0, 10, 5])
+ENCODER_CHUNK_LOOK_BACK = streaming_config.get("encoder_chunk_look_back", 4)
+DECODER_CHUNK_LOOK_BACK = streaming_config.get("decoder_chunk_look_back", 1)
 
 
 @app.websocket("/ws/transcribe")
 async def websocket_transcribe(websocket: WebSocket):
     """
     WebSocket 流式识别接口
+    使用 FunASR cache 机制实现真正的流式识别
 
     协议：
     客户端发送：
@@ -250,10 +256,9 @@ async def websocket_transcribe(websocket: WebSocket):
     active_connections.add(websocket)
     logger.info(f"WebSocket 连接已建立，当前连接数: {len(active_connections)}")
 
-    # 音频缓冲区
-    audio_buffer = []
+    # FunASR 流式识别状态 - 每个连接独立的 cache
+    cache: Dict[str, Any] = {}
     accumulated_text = ""
-    chunks_since_inference = 0
 
     try:
         while True:
@@ -269,44 +274,17 @@ async def websocket_transcribe(websocket: WebSocket):
                 is_final = data.get("is_final", False)
                 audio_format = data.get("format", {})
 
-                logger.info(f"[DEBUG] 收到音频数据，长度: {len(audio_base64)}, is_final: {is_final}")
-
-                # 强制输出到文件
-                with open("/tmp/funasr_trace.log", "a") as f:
-                    f.write(f"[TRACE] 收到数据，长度={len(audio_base64)}, bool={bool(audio_base64)}, is_final={is_final}\n")
-                    f.flush()
-
                 if audio_base64:
-                    with open("/tmp/funasr_trace.log", "a") as f:
-                        f.write(f"[TRACE] 进入 if 块\n")
-                        f.flush()
-
                     try:
-                        with open("/tmp/funasr_trace.log", "a") as f:
-                            f.write(f"[TRACE] 准备解码，audio_base64前10字符={audio_base64[:10]}\n")
-                            f.flush()
-
                         # Base64 解码
                         audio_bytes = base64.b64decode(audio_base64)
-
-                        with open("/tmp/funasr_trace.log", "a") as f:
-                            f.write(f"[TRACE] 解码成功，字节长度={len(audio_bytes)}\n")
-                            f.flush()
-
-                        logger.info(f"[DEBUG] 解码后字节长度: {len(audio_bytes)}")
 
                         # 从原始 PCM 数据转换为 numpy 数组
                         sample_rate = audio_format.get("sample_rate", 16000)
                         channels = audio_format.get("channels", 1)
-                        sample_width = audio_format.get("sample_width", 2)
 
                         # 将字节转换为 int16 数组
                         audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
-                        with open("/tmp/funasr_trace.log", "a") as f:
-                            f.write(f"[TRACE] numpy转换成功，形状={audio_data.shape}\n")
-                            f.flush()
-
-                        logger.info(f"[DEBUG] 转换为 numpy 数组，形状: {audio_data.shape}")
 
                         # 归一化到 [-1, 1]
                         audio_data = audio_data.astype(np.float32) / 32768.0
@@ -315,132 +293,52 @@ async def websocket_transcribe(websocket: WebSocket):
                         if channels == 2:
                             audio_data = audio_data.reshape(-1, 2).mean(axis=1)
 
-                        # 添加到缓冲区
-                        audio_buffer.append(audio_data)
-                        chunks_since_inference += 1
-
-                        with open("/tmp/funasr_trace.log", "a") as f:
-                            f.write(f"[TRACE] 添加到缓冲区，chunks_since_inference={chunks_since_inference}\n")
-                            f.flush()
-
-                    except Exception as e:
-                        with open("/tmp/funasr_trace.log", "a") as f:
-                            f.write(f"[TRACE ERROR] 处理音频数据异常: {e}\n")
-                            f.flush()
-                        raise
-
-                    # 限制缓冲区大小，防止内存溢出
-                    if len(audio_buffer) > MAX_BUFFER_SIZE:
-                        # 移除最旧的块
-                        audio_buffer.pop(0)
-                        logger.warning("缓冲区已满，移除最旧的音频块")
-
-                    # 优化：每 INFERENCE_BATCH_SIZE 块或最终块才推理
-                    should_infer = is_final or chunks_since_inference >= INFERENCE_BATCH_SIZE
-
-                    with open("/tmp/funasr_trace.log", "a") as f:
-                        f.write(f"[TRACE] should_infer={should_infer}, is_final={is_final}, chunks={chunks_since_inference}, buffer_size={len(audio_buffer)}\n")
-                        f.flush()
-
-                    logger.info(f"[DEBUG] should_infer: {should_infer}, chunks_since_inference: {chunks_since_inference}, buffer_size: {len(audio_buffer)}")
-
-                    if should_infer and audio_buffer:
-                        with open("/tmp/funasr_trace.log", "a") as f:
-                            f.write(f"[TRACE] 开始推理，音频长度={len(np.concatenate(audio_buffer))}\n")
-                            f.flush()
-                        # 合并音频
-                        full_audio = np.concatenate(audio_buffer)
-                        chunks_since_inference = 0
-
                         # 音量过滤：检查音频能量是否超过阈值
-                        audio_energy = calculate_audio_energy(full_audio)
-                        with open("/tmp/funasr_trace.log", "a") as f:
-                            f.write(f"[TRACE] 音频能量={audio_energy:.4f}, 阈值={ENERGY_THRESHOLD}\n")
-                            f.flush()
-
-                        if audio_energy < ENERGY_THRESHOLD:
+                        audio_energy = calculate_audio_energy(audio_data)
+                        if audio_energy < ENERGY_THRESHOLD and not is_final:
                             logger.debug(f"音频能量 {audio_energy:.4f} 低于阈值 {ENERGY_THRESHOLD}，跳过识别")
-                            with open("/tmp/funasr_trace.log", "a") as f:
-                                f.write(f"[TRACE] 能量过低，跳过识别\n")
-                                f.flush()
-                            continue  # 跳过低能量音频，不进行识别
+                            continue
 
-                        # 流式识别（在线程池中执行，避免阻塞事件循环）
-                        try:
-                            with open("/tmp/funasr_trace.log", "a") as f:
-                                f.write(f"[TRACE] 调用 asr_model.generate\n")
-                                f.flush()
-
-                            # 定义同步推理函数
-                            def run_inference(audio):
-                                return asr_model.generate(
-                                    input=audio,
-                                    batch_size_s=300,
-                                )
-
-                            # 在线程池中执行推理
-                            loop = asyncio.get_event_loop()
-                            result = await loop.run_in_executor(
-                                inference_executor,
-                                run_inference,
-                                full_audio
+                        # 使用 cache 机制进行流式识别
+                        def run_streaming_inference(audio, is_final_chunk):
+                            """执行流式推理，使用 cache 维护状态"""
+                            return asr_model.generate(
+                                input=audio,
+                                cache=cache,  # 传入 cache，模型会自动更新
+                                is_final=is_final_chunk,
+                                chunk_size=CHUNK_SIZE,
+                                encoder_chunk_look_back=ENCODER_CHUNK_LOOK_BACK,
+                                decoder_chunk_look_back=DECODER_CHUNK_LOOK_BACK,
                             )
 
-                            with open("/tmp/funasr_trace.log", "a") as f:
-                                f.write(f"[TRACE] 推理完成，result={result}\n")
-                                f.flush()
+                        # 在线程池中执行推理
+                        loop = asyncio.get_event_loop()
+                        result = await loop.run_in_executor(
+                            inference_executor,
+                            run_streaming_inference,
+                            audio_data,
+                            is_final
+                        )
 
-                            # 提取文本
-                            new_text = ""
-                            if result and len(result) > 0:
-                                new_text = result[0].get("text", "")
-
-                            with open("/tmp/funasr_trace.log", "a") as f:
-                                f.write(f"[TRACE] new_text='{new_text}', accumulated_text='{accumulated_text}'\n")
-                                f.flush()
-
-                            # 计算增量文本
-                            if new_text.startswith(accumulated_text):
-                                increment = new_text[len(accumulated_text):]
-                            else:
-                                # 如果不是前缀，说明有修正，返回完整文本
-                                increment = new_text
-                                accumulated_text = ""
-
-                            with open("/tmp/funasr_trace.log", "a") as f:
-                                f.write(f"[TRACE] increment='{increment}'\n")
-                                f.flush()
-
-                            # 更新累积文本
-                            accumulated_text = new_text
-
-                            # 发送结果：发送完整累积文本，让客户端计算增量
+                        # 提取文本 - FunASR 流式返回累积文本
+                        if result and len(result) > 0:
+                            new_text = result[0].get("text", "")
                             if new_text:
-                                with open("/tmp/funasr_trace.log", "a") as f:
-                                    f.write(f"[TRACE] 准备发送累积文本: {accumulated_text}\n")
-                                    f.flush()
-
+                                accumulated_text = new_text
+                                # 发送累积文本给客户端
                                 await websocket.send_json({
                                     "type": "partial" if not is_final else "final",
-                                    "text": accumulated_text,  # 发送完整累积文本
+                                    "text": accumulated_text,
                                     "is_final": is_final
                                 })
                                 logger.debug(f"发送累积文本: {accumulated_text}")
 
-                                with open("/tmp/funasr_trace.log", "a") as f:
-                                    f.write(f"[TRACE] 结果已发送\n")
-                                    f.flush()
-                            else:
-                                with open("/tmp/funasr_trace.log", "a") as f:
-                                    f.write(f"[TRACE] increment为空，不发送\n")
-                                    f.flush()
-
-                        except Exception as e:
-                            logger.error(f"识别失败: {e}")
-                            await websocket.send_json({
-                                "type": "error",
-                                "error": str(e)
-                            })
+                    except Exception as e:
+                        logger.error(f"音频处理失败: {e}", exc_info=True)
+                        await websocket.send_json({
+                            "type": "error",
+                            "error": str(e)
+                        })
 
                 # 如果是最后一块，进行标点恢复
                 if is_final and accumulated_text and punc_model:
@@ -459,16 +357,14 @@ async def websocket_transcribe(websocket: WebSocket):
                     except Exception as e:
                         logger.error(f"标点恢复失败: {e}")
 
-                    # 重置状态
-                    audio_buffer = []
+                    # 重置状态 - is_final=True 时重置 cache
+                    cache = {}
                     accumulated_text = ""
-                    chunks_since_inference = 0
 
             elif msg_type == "reset":
                 # 重置状态
-                audio_buffer = []
+                cache = {}
                 accumulated_text = ""
-                chunks_since_inference = 0
                 await websocket.send_json({
                     "type": "reset",
                     "status": "ok"
@@ -491,7 +387,7 @@ async def websocket_transcribe(websocket: WebSocket):
             pass
     finally:
         # 确保资源清理
-        audio_buffer.clear()
+        cache = {}
         accumulated_text = ""
         active_connections.discard(websocket)
         logger.info(f"WebSocket 资源已清理，当前连接数: {len(active_connections)}")
