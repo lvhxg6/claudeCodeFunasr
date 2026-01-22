@@ -25,7 +25,7 @@ streaming:
   sample_rate: 16000
 
   # 推理批次大小（音频块数量）
-  inference_batch_size: 10
+  inference_batch_size: 3
 
   # 最大缓冲区大小
   max_buffer_size: 100

@@ -201,6 +201,32 @@ logging:
   file: "logs/service.log"
 ```
 
+## GPU 加速
+
+服务启动时会自动检测并使用最佳计算设备：
+
+| 设备 | 优先级 | 说明 |
+|------|--------|------|
+| MPS | 1 | Apple Silicon GPU（M1/M2/M3/M4） |
+| CUDA | 2 | NVIDIA GPU |
+| CPU | 3 | 无 GPU 时使用 |
+
+查看服务日志确认使用的设备：
+```bash
+funasr-service logs | grep "使用计算设备"
+# 输出示例：使用计算设备: mps
+```
+
+**性能对比（预估）：**
+
+| 设备 | RTF | 说明 |
+|------|-----|------|
+| CPU | ~14 | 处理 1 秒音频需要 14 秒 |
+| MPS | <1 | 实时或更快 |
+| CUDA | <0.5 | 更快 |
+
+> 注意：FunASR 对 MPS 的支持需要验证。如果遇到问题，服务会自动回退到 CPU。
+
 ## 与 claudeCodeTrigger 集成
 
 在 `claudeCodeTrigger/config.yaml` 中配置：
