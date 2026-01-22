@@ -302,7 +302,7 @@ async def websocket_transcribe(websocket: WebSocket):
                         # 使用 cache 机制进行流式识别
                         def run_streaming_inference(audio, is_final_chunk):
                             """执行流式推理，使用 cache 维护状态"""
-                            return asr_model.generate(
+                            return asr_model.inference(
                                 input=audio,
                                 cache=cache,  # 传入 cache，模型会自动更新
                                 is_final=is_final_chunk,
