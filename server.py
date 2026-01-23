@@ -216,6 +216,7 @@ ENERGY_THRESHOLD = streaming_config.get("energy_threshold", 0.02)
 
 # FunASR 流式参数
 CHUNK_SIZE = streaming_config.get("chunk_size", [0, 10, 5])
+CHUNK_STRIDE = streaming_config.get("chunk_stride", CHUNK_SIZE[1] * 960)  # 9600 采样点 = 600ms
 ENCODER_CHUNK_LOOK_BACK = streaming_config.get("encoder_chunk_look_back", 4)
 DECODER_CHUNK_LOOK_BACK = streaming_config.get("decoder_chunk_look_back", 1)
 
@@ -258,7 +259,8 @@ async def websocket_transcribe(websocket: WebSocket):
 
     # FunASR 流式识别状态 - 每个连接独立的 cache
     cache: Dict[str, Any] = {}
-    accumulated_text = ""
+    audio_buffer: list = []           # 累积音频块
+    accumulated_text = ""              # 累积识别文本
 
     try:
         while True:
@@ -293,45 +295,70 @@ async def websocket_transcribe(websocket: WebSocket):
                         if channels == 2:
                             audio_data = audio_data.reshape(-1, 2).mean(axis=1)
 
-                        # 音量过滤：检查音频能量是否超过阈值
-                        audio_energy = calculate_audio_energy(audio_data)
-                        if audio_energy < ENERGY_THRESHOLD and not is_final:
-                            logger.debug(f"音频能量 {audio_energy:.4f} 低于阈值 {ENERGY_THRESHOLD}，跳过识别")
-                            continue
+                        # 将音频块加入缓冲区
+                        audio_buffer.append(audio_data)
+                        total_samples = sum(len(chunk) for chunk in audio_buffer)
 
-                        # 使用 cache 机制进行流式识别
-                        def run_streaming_inference(audio, is_final_chunk):
-                            """执行流式推理，使用 cache 维护状态"""
-                            return asr_model.inference(
-                                input=audio,
-                                cache=cache,  # 传入 cache，模型会自动更新
-                                is_final=is_final_chunk,
-                                chunk_size=CHUNK_SIZE,
-                                encoder_chunk_look_back=ENCODER_CHUNK_LOOK_BACK,
-                                decoder_chunk_look_back=DECODER_CHUNK_LOOK_BACK,
-                            )
+                        # 达到 CHUNK_STRIDE (600ms) 或 is_final 时才推理
+                        if total_samples >= CHUNK_STRIDE or is_final:
+                            # 合并所有音频块
+                            full_audio = np.concatenate(audio_buffer)
 
-                        # 在线程池中执行推理
-                        loop = asyncio.get_event_loop()
-                        result = await loop.run_in_executor(
-                            inference_executor,
-                            run_streaming_inference,
-                            audio_data,
-                            is_final
-                        )
+                            # 处理完整的 600ms 块
+                            while len(full_audio) >= CHUNK_STRIDE or (is_final and len(full_audio) > 0):
+                                # 取出要处理的音频块
+                                if len(full_audio) >= CHUNK_STRIDE:
+                                    chunk_to_process = full_audio[:CHUNK_STRIDE]
+                                    full_audio = full_audio[CHUNK_STRIDE:]
+                                else:
+                                    # is_final 且剩余不足一个 chunk
+                                    chunk_to_process = full_audio
+                                    full_audio = np.array([], dtype=np.float32)
 
-                        # 提取文本 - FunASR 流式返回累积文本
-                        if result and len(result) > 0:
-                            new_text = result[0].get("text", "")
-                            if new_text:
-                                accumulated_text = new_text
-                                # 发送累积文本给客户端
-                                await websocket.send_json({
-                                    "type": "partial" if not is_final else "final",
-                                    "text": accumulated_text,
-                                    "is_final": is_final
-                                })
-                                logger.debug(f"发送累积文本: {accumulated_text}")
+                                # 音量过滤：检查音频能量是否超过阈值
+                                audio_energy = calculate_audio_energy(chunk_to_process)
+                                if audio_energy < ENERGY_THRESHOLD and not is_final:
+                                    logger.debug(f"音频能量 {audio_energy:.4f} 低于阈值 {ENERGY_THRESHOLD}，跳过识别")
+                                    continue
+
+                                # 使用 generate() 进行流式识别
+                                def run_streaming_inference(audio, is_final_chunk):
+                                    """执行流式推理，使用 cache 维护状态"""
+                                    return asr_model.generate(
+                                        input=audio,
+                                        cache=cache,  # 传入 cache，模型会自动更新
+                                        is_final=is_final_chunk,
+                                        chunk_size=CHUNK_SIZE,
+                                        encoder_chunk_look_back=ENCODER_CHUNK_LOOK_BACK,
+                                        decoder_chunk_look_back=DECODER_CHUNK_LOOK_BACK,
+                                    )
+
+                                # 在线程池中执行推理
+                                loop = asyncio.get_event_loop()
+                                # 只有最后一个块且 is_final 才传 True
+                                is_final_chunk = is_final and len(full_audio) == 0
+                                result = await loop.run_in_executor(
+                                    inference_executor,
+                                    run_streaming_inference,
+                                    chunk_to_process,
+                                    is_final_chunk
+                                )
+
+                                # 提取增量文本并累积
+                                if result and len(result) > 0:
+                                    increment = result[0].get("text", "")
+                                    if increment:
+                                        accumulated_text += increment  # 累积增量文本
+                                        # 发送累积文本给客户端
+                                        await websocket.send_json({
+                                            "type": "partial" if not is_final_chunk else "final",
+                                            "text": accumulated_text,
+                                            "is_final": is_final_chunk
+                                        })
+                                        logger.debug(f"发送累积文本: {accumulated_text} (增量: {increment})")
+
+                            # 保留剩余的音频到下次处理
+                            audio_buffer = [full_audio] if len(full_audio) > 0 else []
 
                     except Exception as e:
                         logger.error(f"音频处理失败: {e}", exc_info=True)
@@ -359,11 +386,13 @@ async def websocket_transcribe(websocket: WebSocket):
 
                     # 重置状态 - is_final=True 时重置 cache
                     cache = {}
+                    audio_buffer = []
                     accumulated_text = ""
 
             elif msg_type == "reset":
                 # 重置状态
                 cache = {}
+                audio_buffer = []
                 accumulated_text = ""
                 await websocket.send_json({
                     "type": "reset",
@@ -388,6 +417,7 @@ async def websocket_transcribe(websocket: WebSocket):
     finally:
         # 确保资源清理
         cache = {}
+        audio_buffer = []
         accumulated_text = ""
         active_connections.discard(websocket)
         logger.info(f"WebSocket 资源已清理，当前连接数: {len(active_connections)}")

@@ -18,8 +18,8 @@ server:
   ws_path: "/ws/transcribe"
 
 streaming:
-  # 音频块大小（毫秒）
-  chunk_ms: 200
+  # 音频块大小（毫秒）- 服务端累积到此大小才推理
+  chunk_ms: 600
 
   # 采样率
   sample_rate: 16000
@@ -29,6 +29,9 @@ streaming:
   # 10*60ms=600ms 处理窗口, 5*60ms=300ms 前向看
   # 总延迟约 900ms
   chunk_size: [0, 10, 5]
+
+  # 每次推理的采样点数 (CHUNK_SIZE[1] * 960 = 9600)
+  chunk_stride: 9600
 
   # 编码器/解码器回看
   encoder_chunk_look_back: 4
